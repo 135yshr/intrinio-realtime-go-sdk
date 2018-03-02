@@ -27,6 +27,12 @@ const (
 	QUODD provider = "quodd"
 )
 
+const (
+	writeWait     = 10 * time.Second
+	readWait      = 30 * time.Second
+	heartbeatWait = 3 * time.Second
+)
+
 // Client Overview
 type Client struct {
 	DebugMode bool
@@ -43,10 +49,11 @@ type Client struct {
 	quoteHander  func(quote map[string]interface{})
 	errorHandler func(err error)
 
-	sending       chan struct{}
 	breakHartbeat chan struct{}
 	breakSender   chan struct{}
+	sended        chan struct{}
 	q             chan map[string]interface{}
+	closing       bool
 }
 
 // New Overview
@@ -58,16 +65,13 @@ func New(username, password string, provider provider) *Client {
 		DebugMode:      false,
 		channels:       make(map[string]bool),
 		joinedChannels: make(map[string]bool),
-		sending:        make(chan struct{}, 1),
-		breakHartbeat:  make(chan struct{}, 1),
-		breakSender:    make(chan struct{}, 1),
-		q:              make(chan map[string]interface{}),
 	}
 }
 
 // Connect Overview
 func (cli *Client) Connect() error {
 	cli.debug("%s\n", "Websocket connecting...")
+	cli.channelInitialize()
 	if err := cli.refreshToken(); err != nil {
 		return err
 	}
@@ -76,25 +80,19 @@ func (cli *Client) Connect() error {
 
 // Disconnect Overview
 func (cli *Client) Disconnect() error {
-	if cli.connected() == false {
+	if cli.Connected() == false {
+		return nil
+	}
+	if cli.closing {
 		return nil
 	}
 
 	cli.onClosing()
-
 	close(cli.breakHartbeat)
 	close(cli.breakSender)
-	<-cli.sending
-
-	err := cli.ws.Close()
-	if err != nil {
-		cli.onCloseFailed()
-		return err
-	}
-	cli.ws = nil
-	time.Sleep(time.Second)
+	<-cli.sended
 	cli.onClosed()
-	return err
+	return nil
 }
 
 // Join Overview
@@ -111,10 +109,7 @@ func (cli *Client) Join(channels ...string) {
 // Leave Overview
 func (cli *Client) Leave(channels ...string) {
 	for _, channel := range channels {
-		fmt.Println(channels)
-		fmt.Println(cli.channels)
 		delete(cli.channels, strings.TrimSpace(channel))
-		fmt.Println(cli.channels)
 	}
 	cli.refreshChannels()
 }
@@ -123,6 +118,19 @@ func (cli *Client) Leave(channels ...string) {
 func (cli *Client) LeaveAll() {
 	cli.channels = make(map[string]bool)
 	cli.refreshChannels()
+}
+
+// Connected Overview
+func (cli *Client) Connected() bool {
+	return cli.ws != nil
+}
+
+func (cli *Client) channelInitialize() {
+	cli.breakHartbeat = make(chan struct{}, 1)
+	cli.breakSender = make(chan struct{}, 1)
+	cli.sended = make(chan struct{}, 1)
+	cli.q = make(chan map[string]interface{})
+	cli.closing = false
 }
 
 func (cli *Client) refreshToken() error {
@@ -151,7 +159,7 @@ func (cli *Client) refreshToken() error {
 }
 
 func (cli *Client) refreshWebsocket() error {
-	if cli.connected() {
+	if cli.Connected() {
 		cli.Disconnect()
 	}
 
@@ -165,7 +173,7 @@ func (cli *Client) refreshWebsocket() error {
 }
 
 func (cli *Client) refreshChannels() {
-	if cli.connected() == false {
+	if cli.Connected() == false {
 		return
 	}
 	for k := range cli.channels {
@@ -185,59 +193,59 @@ func (cli *Client) refreshChannels() {
 }
 
 func (cli *Client) startReceiver() {
-	go func() {
-		for {
-			var ret map[string]interface{}
-			err := cli.ws.ReadJSON(&ret)
-			if err != nil {
-				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-					cli.onError(err)
-				}
-				return
-			}
-			cli.onQuote(ret)
-		}
+	defer func() {
+		cli.Disconnect()
 	}()
+	for {
+		cli.ws.SetReadDeadline(time.Now().Add(readWait))
+		var ret map[string]interface{}
+		if err := cli.ws.ReadJSON(&ret); err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				cli.onError(err)
+			}
+			return
+		}
+		cli.onQuote(ret)
+	}
 }
 
 func (cli *Client) startSender() {
-	go func() {
-		for {
-			select {
-			case data := <-cli.q:
-				cli.debug("send data = %v\n", data)
-				if err := cli.ws.WriteJSON(data); err != nil {
-					cli.onError(err)
-				}
-			case <-cli.breakSender:
-				for 0 < len(cli.q) {
-					cli.debug("Quit sender! queue count = %d\n", len(cli.q))
-					time.Sleep(100 * time.Millisecond)
-				}
-				close(cli.sending)
-				return
-			}
+	defer func() {
+		cli.debug("close sender")
+		for 0 < len(cli.q) {
+			cli.debug("Quit sender! queue count = %d\n", len(cli.q))
+			time.Sleep(100 * time.Millisecond)
 		}
+		close(cli.q)
+		cli.ws.Close()
+		cli.ws = nil
+		close(cli.sended)
 	}()
+	for {
+		select {
+		case data := <-cli.q:
+			cli.debug("send data = %v\n", data)
+			cli.ws.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := cli.ws.WriteJSON(data); err != nil {
+				cli.onError(err)
+			}
+		case <-cli.breakSender:
+			return
+		}
+	}
 }
 
 func (cli *Client) heartbeat() {
-	go func() {
-		hearbeatTime := time.NewTicker(3 * time.Second)
-		defer hearbeatTime.Stop()
-		for {
-			select {
-			case <-hearbeatTime.C:
-				cli.q <- makeHeartbeatMessage(cli.provider)
-			case <-cli.breakHartbeat:
-				return
-			}
+	hearbeatTime := time.NewTicker(heartbeatWait)
+	defer hearbeatTime.Stop()
+	for {
+		select {
+		case <-hearbeatTime.C:
+			cli.q <- makeHeartbeatMessage(cli.provider)
+		case <-cli.breakHartbeat:
+			return
 		}
-	}()
-}
-
-func (cli *Client) connected() bool {
-	return cli.ws != nil
+	}
 }
 
 func (cli *Client) debug(format string, a ...interface{}) {
@@ -249,19 +257,22 @@ func (cli *Client) debug(format string, a ...interface{}) {
 
 func (cli *Client) onConnected() {
 	cli.debug("%s\n", "Websocket connected")
-	cli.startReceiver()
-	cli.startSender()
-	cli.heartbeat()
+	go cli.startReceiver()
+	go cli.startSender()
+	go cli.heartbeat()
 }
 
 func (cli *Client) onClosing() {
+	cli.closing = true
 	cli.debug("%s\n", "Websocket closing")
 }
 func (cli *Client) onCloseFailed() {
+	cli.closing = false
 	cli.debug("%s\n", "Websocket failed close")
 }
 
 func (cli *Client) onClosed() {
+	cli.closing = false
 	cli.debug("%s\n", "Websocket closed")
 }
 
