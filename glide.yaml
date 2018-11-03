@@ -1,4 +1,0 @@
-package: github.com/135yshr/intrinio-realtime-go-sdk
-import:
-- package: github.com/gorilla/websocket
-  version: ^1.2.0
